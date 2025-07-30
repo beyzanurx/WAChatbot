@@ -2,6 +2,7 @@ from flask import Flask, request, jsonify
 from wit import Wit
 from dotenv import load_dotenv
 import os
+import requests
 
 # .env-Datei laden
 load_dotenv()
@@ -28,7 +29,7 @@ antworten = {
 
 @app.route("/")
 def home():
-    return "✅ Flask läuft mit wit.ai!"
+    return "✅ Flask + wit.ai + WhatsApp Cloud API läuft!"
 
 @app.route("/frage", methods=["POST"])
 def frage():
@@ -45,6 +46,48 @@ def frage():
         "antwort": reaktion
     })
 
+def sende_whatsapp_nachricht(telefonnummer, text):
+    url = f"https://graph.facebook.com/v18.0/{os.getenv('PHONE_NUMBER_ID')}/messages"
+    headers = {
+        "Authorization": f"Bearer {os.getenv('WHATSAPP_TOKEN')}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": telefonnummer,
+        "type": "text",
+        "text": {"body": text}
+    }
+    response = requests.post(url, headers=headers, json=payload)
+    print("Antwort gesendet:", response.json())
+
+@app.route("/webhook", methods=["GET", "POST"])
+def webhook():
+    if request.method == "GET":
+        mode = request.args.get("hub.mode")
+        token = request.args.get("hub.verify_token")
+        challenge = request.args.get("hub.challenge")
+
+        if mode == "subscribe" and token == os.getenv("VERIFICATION_TOKEN"):
+            return challenge, 200
+        return "Unauthorized", 403
+
+    if request.method == "POST":
+        daten = request.get_json()
+        try:
+            eintrag = daten["entry"][0]["changes"][0]["value"]["messages"][0]
+            text = eintrag["text"]["body"]
+            nummer = eintrag["from"]
+
+            wit_antwort = client.message(text)
+            intent = wit_antwort.get("intents", [{}])[0].get("name", "default")
+            reaktion = antworten.get(intent, antworten["default"])
+
+            sende_whatsapp_nachricht(nummer, reaktion)
+        except Exception as e:
+            print("Fehler beim Verarbeiten der Nachricht:", e)
+
+        return "OK", 200
 
 if __name__ == "__main__":
     app.run(port=5000)
