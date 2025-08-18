@@ -1,93 +1,164 @@
+# test_flask.py
 from flask import Flask, request, jsonify
 from wit import Wit
 from dotenv import load_dotenv
 import os
 import requests
+import psycopg2
+from psycopg2 import Error as PgError
+from requests import RequestException
 
-# .env-Datei laden
+# ---------------------------------------------------------
+# .env laden & Clients bauen
+# ---------------------------------------------------------
 load_dotenv()
-
+WIT_TOKEN        = os.getenv("WIT_TOKEN")
+WHATSAPP_TOKEN   = os.getenv("WHATSAPP_TOKEN")          # 60-Tage-Token
+PHONE_NUMBER_ID  = os.getenv("PHONE_NUMBER_ID")
+VERIFICATION_TOKEN = os.getenv("VERIFICATION_TOKEN")
+DATABASE_URL     = os.getenv("DATABASE_URL")
 
 app = Flask(__name__)
-client = Wit(os.getenv("WIT_TOKEN"))
+wit_client = Wit(WIT_TOKEN)
 
-# Antworten für erkannte Intents
-antworten = {
-    "notfall": "Ich informiere sofort den Notdienst!",
-    "reklamation": "Es tut mir leid! Bitte schildern Sie Ihr Problem an service@example.com.",
-    "verabschiedung": "Auf Wiedersehen! 👋",
-    "hoeflichkeit": "Gern geschehen!",
-    "kontakt": "Sie erreichen uns unter 0123 456789 oder kontakt@example.com.",
-    "leistungen": "Wir bieten Rohrreinigung, Wartung, Notdienste und mehr an.",
-    "oeffnungszeiten": "Unsere Öffnungszeiten: Mo–Fr, 8–18 Uhr.",
-    "preise": "Gerne! Unsere Preisliste finden Sie auf der Website oder per Mail.",
-    "standort": "Wir sind in Berlin, Hamburg und Umgebung tätig.",
-    "verf_gbarkeit": "Wir sind rund um die Uhr erreichbar!",
-    "termin_buchen": "Wann möchten Sie den Termin? Wir melden uns gleich!",
-    "default": "Das habe ich leider nicht verstanden. Bitte formulieren Sie es anders."
-}
+# ---------------------------------------------------------
+# Hilfsfunktionen
+# ---------------------------------------------------------
+def get_db():
+    return psycopg2.connect(DATABASE_URL)
 
-@app.route("/")
-def home():
-    return "✅ Flask + wit.ai + WhatsApp Cloud API läuft!"
+def top_intent(text: str, min_conf: float = 0.5) -> str:
+    """liefert den besten wit.ai-Intentnamen oder 'default' bei geringer Confidence."""
+    try:
+        resp = wit_client.message(text)
+        intents = resp.get("intents", [])
+        if intents:
+            cand = intents[0]
+            if cand.get("confidence", 0) >= min_conf and cand.get("name"):
+                return cand["name"]
+    except Exception as ex:
+        print("⚠️ wit.ai Fehler:", ex)
+    return "default"
 
-@app.route("/frage", methods=["POST"])
-def frage():
-    daten = request.get_json()
-    nachricht = daten.get("text", "")
+def save_termin(telefon: str, nachricht: str, intent: str) -> None:
+    try:
+        with get_db() as conn, conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO termine (telefonnummer, nachricht, intent) VALUES (%s, %s, %s)",
+                (telefon, nachricht, intent),
+            )
+        print("✅ Termin gespeichert.")
+    except PgError as es:
+        print("❌ DB-Fehler:", es)
 
-
-    wit_antwort = client.message(nachricht)
-    intent = wit_antwort.get("intents", [{}])[0].get("name", "default")
-    reaktion = antworten.get(intent, antworten["default"])
-
-    return jsonify({
-        "intent": intent,
-        "antwort": reaktion
-    })
-
-def sende_whatsapp_nachricht(telefonnummer, text):
-    url = f"https://graph.facebook.com/v18.0/{os.getenv('PHONE_NUMBER_ID')}/messages"
+def send_whatsapp(to: str, body: str) -> None:
+    url = f"https://graph.facebook.com/v18.0/{PHONE_NUMBER_ID}/messages"
     headers = {
-        "Authorization": f"Bearer {os.getenv('WHATSAPP_TOKEN')}",
-        "Content-Type": "application/json"
+        "Authorization": f"Bearer {WHATSAPP_TOKEN}",
+        "Content-Type": "application/json",
     }
     payload = {
         "messaging_product": "whatsapp",
-        "to": telefonnummer,
+        "to": to,
         "type": "text",
-        "text": {"body": text}
+        "text": {"body": body},
     }
-    response = requests.post(url, headers=headers, json=payload)
-    print("Antwort gesendet:", response.json())
+    try:
+        r = requests.post(url, headers=headers, json=payload, timeout=15)
+        r.raise_for_status()
+        print("📤 WA OK:", r.json())
+    except RequestException as ec:
+        print("❌ WhatsApp 401/403/…:", ec)
+
+# ---------------------------------------------------------
+# Antworten pro Intent (Namen müssen zu deinen wit.ai-Intents passen)
+# ---------------------------------------------------------
+ANTWORTEN = {
+    "notfall":         "Ich informiere sofort den Notdienst!",
+    "reklamation":     "Es tut mir leid! Bitte schildern Sie Ihr Problem an service@example.com.",
+    "verabschiedung":  "Auf Wiedersehen! 👋",
+    "hoeflichkeit":    "Gern geschehen!",
+    "kontakt":         "Sie erreichen uns unter 0123 456789 oder kontakt@example.com.",
+    "leistungen":      "Wir bieten Rohrreinigung, Wartung, Notdienste und mehr an.",
+    "oeffnungszeiten": "Unsere Öffnungszeiten: Mo–Fr, 8–18 Uhr.",
+    "preise":          "Gerne! Unsere Preisliste finden Sie auf der Website oder per Mail.",
+    "standort":        "Wir sind in Berlin, Hamburg und Umgebung tätig.",
+    "verf_gbarkeit":   "Wir sind rund um die Uhr erreichbar!",
+    "termin_buchen":   "Wann möchten Sie den Termin? Wir melden uns gleich!",
+    "default":         "Das habe ich leider nicht verstanden. Bitte formulieren Sie es anders.",
+}
+
+# ---------------------------------------------------------
+# Routen
+# ---------------------------------------------------------
+@app.route("/")
+def root():
+    return "✅ Flask + wit.ai + WhatsApp Cloud API + PostgreSQL läuft!"
+
+@app.route("/frage", methods=["POST"])
+def frage():
+    data = request.get_json(silent=True) or {}
+    text = (data.get("text") or "").strip()
+    if not text:
+        return jsonify({"error": "Kein Text"}), 400
+    intent = top_intent(text)
+    return jsonify({"intent": intent, "antwort": ANTWORTEN.get(intent, ANTWORTEN["default"])})
 
 @app.route("/webhook", methods=["GET", "POST"])
 def webhook():
+    # 1) Verifizierung
     if request.method == "GET":
         mode = request.args.get("hub.mode")
         token = request.args.get("hub.verify_token")
         challenge = request.args.get("hub.challenge")
-
-        if mode == "subscribe" and token == os.getenv("VERIFICATION_TOKEN"):
+        if mode == "subscribe" and token == VERIFICATION_TOKEN:
             return challenge, 200
         return "Unauthorized", 403
 
-    if request.method == "POST":
-        daten = request.get_json()
-        try:
-            eintrag = daten["entry"][0]["changes"][0]["value"]["messages"][0]
-            text = eintrag["text"]["body"]
-            nummer = eintrag["from"]
+    # 2) Nachrichten empfangen
+    data = request.get_json(silent=True) or {}
+    try:
+        value = data["entry"][0]["changes"][0]["value"]
 
-            wit_antwort = client.message(text)
-            intent = wit_antwort.get("intents", [{}])[0].get("name", "default")
-            reaktion = antworten.get(intent, antworten["default"])
+        # Status-Updates ignorieren
+        if value.get("statuses"):
+            return "OK", 200
 
-            sende_whatsapp_nachricht(nummer, reaktion)
-        except Exception as e:
-            print("Fehler beim Verarbeiten der Nachricht:", e)
+        msgs = value.get("messages") or []
+        if not msgs:
+            return "OK", 200
 
-        return "OK", 200
+        msg = msgs[0]
+        from_number = msg.get("from")
+        text = (msg.get("text", {}).get("body") or "").strip()
+        if not (from_number and text):
+            return "OK", 200
 
+        intent = top_intent(text)                  # <- hier passiert die Klassifikation über wit.ai
+        reply = ANTWORTEN.get(intent, ANTWORTEN["default"])
+
+        if intent == "termin_buchen":
+            save_termin(from_number, text, intent)
+
+        send_whatsapp(from_number, reply)
+
+    except (KeyError, IndexError) as ex:
+        print("❌ Unerwartetes Webhook-Format:", ex)
+    except PgError as ex:
+        print("❌ DB-Fehler:", ex)
+    except RequestException as ex:
+        print("❌ WhatsApp-API-Fehler:", ex)
+
+    return "OK", 200
+
+# ---------------------------------------------------------
+# Start
+# ---------------------------------------------------------
 if __name__ == "__main__":
+    try:
+        with get_db() as _:
+            print("🟢 DB-Check ok")
+    except PgError as e:
+        print("🔴 DB-Check fehlgeschlagen:", e)
+
     app.run(port=5000)
